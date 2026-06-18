@@ -1,173 +1,95 @@
 from io import BytesIO
-import cv2
-import numpy as np
 import pandas as pd
-import pytesseract
 import streamlit as st
-
-
-def extract_table_from_image(image_bytes):
-    """Processes the image from raw bytes and returns a list of lists containing cell data."""
-    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    if img is None:
-        raise ValueError("Could not decode the image file.")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # Adaptive thresholding handles shadows/lighting variations better dynamically
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
-    )
-
-    cols = thresh.shape[1]
-    rows = thresh.shape[0]
-
-    # Making scale more sensitive to capture thinner or fainter grid lines
-    horizontal_size = cols // 50
-    vertical_size = rows // 50
-
-    horizontal_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (horizontal_size, 1)
-    )
-    detect_horizontal = cv2.morphologyEx(
-        thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2
-    )
-
-    vertical_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (1, vertical_size)
-    )
-    detect_vertical = cv2.morphologyEx(
-        thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2
-    )
-
-    table_mask = cv2.addWeighted(detect_horizontal, 0.5, detect_vertical, 0.5, 0)
-    table_mask = cv2.threshold(table_mask, 0, 255, cv2.THRESH_BINARY)[1]
-
-    contours, _ = cv2.findContours(
-        table_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    box_list = []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        # Drop extreme noise but keep smaller valid cells
-        if (
-            w > 15
-            and h > 10
-            and w < (img.shape[1] * 0.98)
-            and h < (img.shape[0] * 0.98)
-        ):
-            box_list.append((x, y, w, h))
-
-    if not box_list:
-        raise ValueError(
-            "No clear table structure or grid lines detected in the image."
-        )
-
-    box_list = sorted(box_list, key=lambda b: (b[1], b[0]))
-
-    rows_data = []
-    current_row = []
-    y_tolerance = 12  # Slightly widened tolerance for rows that slant slightly
-    prev_y = box_list[0][1]
-
-    for box in box_list:
-        x, y, w, h = box
-        if y - prev_y > y_tolerance:
-            current_row = sorted(current_row, key=lambda b: b[0])
-            rows_data.append(current_row)
-            current_row = []
-            prev_y = y
-        current_row.append(box)
-
-    if current_row:
-        current_row = sorted(current_row, key=lambda b: b[0])
-        rows_data.append(current_row)
-
-    table_content = []
-    config = "--psm 6"
-
-    for row in rows_data:
-        row_cells = []
-        for box in row:
-            x, y, w, h = box
-            padding = 1
-            cell_crop = gray[
-                max(0, y - padding) : min(img.shape[0], y + h + padding),
-                max(0, x - padding) : min(img.shape[1], x + w + padding),
-            ]
-
-            text = pytesseract.image_to_string(cell_crop, config=config).strip()
-            row_cells.append(text)
-        table_content.append(row_cells)
-
-    max_cols = max(len(r) for r in table_content)
-    for r in table_content:
-        while len(r) < max_cols:
-            r.append("")
-
-    return table_content
-
+from img2table.document import Image
+from img2table.ocr import TesseractOCR
 
 # --- STREAMLIT UI SETUP ---
-st.set_page_config(page_title="Generic Image Table Extractor", layout="wide")
-st.title("📊 Generic Image Table Extractor")
-st.write("Upload any image containing a structured data table.")
+st.set_page_config(
+    page_title="Smart Image Table Extractor", layout="wide", page_icon="📊"
+)
+st.title("📊 Smart Image Table Extractor")
+st.write(
+    "Upload any image containing a multi-column table to structuralize and export it perfectly to Excel."
+)
 
 uploaded_file = st.file_uploader(
     "Choose a table image...", type=["jpg", "jpeg", "png", "bmp"]
 )
 
 if uploaded_file is not None:
+    # Safely present the original document image
     st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
 
-    if st.button("🚀 Process and Extract Table"):
-        with st.spinner("Extracting cells and reading text via OCR..."):
+    if st.button("🚀 Process and Structuralize Table"):
+        with st.spinner("Analyzing layout and reading data cleanly via OCR..."):
             try:
-                img_bytes = uploaded_file.read()
-                raw_data = extract_table_from_image(img_bytes)
+                # 1. Read file bytes directly into memory
+                img_bytes = uploaded_file.getvalue()
 
-                df = pd.DataFrame(raw_data)
+                # 2. Instantiate modern img2table Document & OCR Engine wrapper
+                # It natively runs inside Streamlit Cloud's Linux environment
+                doc = Image(src=img_bytes)
+                ocr = TesseractOCR(lang="eng")
 
-                # --- FIX FOR DUPLICATE/EMPTY HEADERS ---
-                if len(df) > 0:
-                    header_row = df.iloc[0].astype(str).tolist()
-
-                    # Clean headers and handle blanks/duplicates safely
-                    seen = {}
-                    new_headers = []
-                    for i, head in enumerate(header_row):
-                        head_clean = head.strip().replace("\n", " ")
-                        if not head_clean:
-                            head_clean = f"Column_{i+1}"
-
-                        if head_clean in seen:
-                            seen[head_clean] += 1
-                            head_clean = f"{head_clean}_{seen[head_clean]}"
-                        else:
-                            seen[head_clean] = 0
-
-                        new_headers.append(head_clean)
-
-                    df.columns = new_headers
-                    df = df[1:].reset_index(drop=True)
-
-                st.success("Extraction complete!")
-                st.dataframe(df, use_container_width=True)
-
-                excel_buffer = BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-                    df.to_excel(writer, index=False, sheet_name="Extracted Table")
-                excel_data = excel_buffer.getvalue()
-
-                st.download_button(
-                    label="💾 Download Table as Excel File",
-                    data=excel_data,
-                    file_name=f"extracted_{uploaded_file.name.split('.')[0]}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                # 3. Extract tables natively factoring implicit row structural analysis
+                extracted_tables = doc.extract_tables(
+                    ocr=ocr, implicit_rows=True, borderless_tables=False
                 )
 
+                if not extracted_tables:
+                    st.error(
+                        "No structured table layout could be automatically isolated from this image. Ensure the image has visible columns."
+                    )
+                else:
+                    st.success(
+                        f"Successfully found and reconstructed {len(extracted_tables)} table(s)!"
+                    )
+
+                    # Create an in-memory byte buffer for writing the Excel file
+                    excel_buffer = BytesIO()
+
+                    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                        for idx, table in enumerate(extracted_tables):
+                            # Convert native img2table struct directly to a Pandas DataFrame
+                            df = table.df
+
+                            # Clean up row index headers if first row acts as the primary column title
+                            if len(df) > 1:
+                                df.columns = df.iloc[0].astype(str)
+                                df = df[1:].reset_index(drop=True)
+
+                            # Sanitize empty naming or line breaks out of headers
+                            df.columns = [
+                                str(c).replace("\n", " ").strip()
+                                if str(c).strip()
+                                else f"Column_{i+1}"
+                                for i, c in enumerate(df.columns)
+                            ]
+
+                            # Display the extracted preview grid visually on webpage
+                            st.subheader(f"Table Preview {idx + 1}")
+                            st.dataframe(df, use_container_width=True)
+
+                            # Append sheet structure to data buffer
+                            df.to_excel(
+                                writer,
+                                index=False,
+                                sheet_name=f"Table_{idx + 1}",
+                            )
+
+                    # Fetch raw binary representation of completed workbook
+                    excel_data = excel_buffer.getvalue()
+
+                    # Provide download button for the spreadsheet
+                    st.download_button(
+                        label="💾 Download Structured Excel Workbook",
+                        data=excel_data,
+                        file_name=f"extracted_{uploaded_file.name.split('.')[0]}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
             except Exception as e:
-                st.error(f"An error occurred: {e}")
+                st.error(
+                    f"An error occurred during layout conversion: {str(e)}"
+                )
